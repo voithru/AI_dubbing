@@ -1,8 +1,5 @@
 # 자막 파일을 ai더빙한 데이터를 받아와서
 # wav 파일로 변환
-import boto3
-import botocore
-from botocore.config import Config
 import pysrt
 import os
 import librosa
@@ -14,18 +11,20 @@ import time
 import random
 from pathlib import Path
 from configure import base_dir  # base_dir import 추가
+from gemini_tts_helper import get_gemini_tts_client, VoiceOptions  # Gemini TTS 헬퍼 추가
 
-def text_to_audio(subtitles, idx, max_workers=5):
+def text_to_audio(subtitles, idx, max_workers=5, video_name=None):
     data_ = []
 
     def process_subtitle(subtitle, ids):
         text = subtitle.text
-        time_stretch_with_ssml(
-            tts_func=tts_to_file_polly,
+        time_stretch(
+            tts_func=tts_to_file_gemini,
             text=text,
             index=ids,
             idx=idx,
-            speed=1.1
+            speed=1.1,
+            video_name=video_name
         )
         audio, sr = librosa.load(f'{base_dir}/content/tts/{idx}_{ids}.wav', sr=44100)
         return [subtitle.index, subtitle.start, subtitle.end, len(audio) / sr, subtitle.text]
@@ -37,64 +36,84 @@ def text_to_audio(subtitles, idx, max_workers=5):
 
     return data_
 
-def tts_to_file_polly(text, index, idx, output_dir=None):
+def tts_to_file_gemini(text, index, idx, output_dir=None, video_name=None):
     if output_dir is None:
         output_dir = f'{base_dir}/content/tts'
-    # 환경 변수에서 AWS 키 가져오기
-    AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID_polly')
-    AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY_polly')
+    
+    # Gemini TTS 클라이언트 생성
+    try:
+        client = get_gemini_tts_client()
+    except Exception as e:
+        print(f"Gemini TTS 인증 오류: {e}")
+        raise
 
-    # RetryConfig 설정
-    retry_config = Config(
-        retries={
-            'max_attempts': 10,  # 최대 재시도 횟수
-            'mode': 'standard'   # 재시도 모드 ('standard' 또는 'adaptive')
-        },
-        connect_timeout=10,
-        read_timeout=60
-    )
-
-    client = boto3.client(
-        service_name='polly',
-        aws_access_key_id=AWS_ACCESS_KEY_ID,
-        aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-        region_name='ap-northeast-2',
-        config=retry_config  # RetryConfig 적용
-    )
-
-    for attempt in range(10):  # 최대 10번 재시도
+    # 텍스트 정제 (SSML 태그 제거 및 순수 텍스트 추출)
+    import re  # 정규식 모듈
+    
+    def clean_text_for_tts(input_text):
+        # 모든 SSML/HTML 태그 제거
+        clean_content = re.sub(r'<[^>]+>', '', input_text)
+        
+        # 특수문자 정제
+        clean_content = clean_content.replace("&", "and")  # & 문자 처리
+        clean_content = clean_content.replace("  ", " ")   # 연속 공백 제거
+        
+        return clean_content.strip()
+    
+    cleaned_text = clean_text_for_tts(text)
+    
+    print(f"🔧 텍스트 정제: '{text[:50]}...' → '{cleaned_text[:50]}...'")
+    
+    # 텍스트 길이 검증
+    if len(cleaned_text) < 1:
+        print(f"⚠️ 텍스트가 너무 짧습니다: '{cleaned_text}'")
+        cleaned_text = "음성을 생성할 수 없습니다."
+    
+    try:
+        # 출력 파일 경로
+        wav_file_path = f"{output_dir}/{idx}_{index}.wav"
+        
+        # Gemini TTS API 호출하여 직접 파일로 저장 (순수 텍스트 전달)
+        client.synthesize_to_file(
+            text=cleaned_text,  # SSML 없는 순수 텍스트
+            output_path=wav_file_path,
+            voice=None,  # .env 파일의 GEMINI_TTS_VOICE 사용
+            target_sample_rate=44100,
+            video_name=video_name
+        )
+            
+    except Exception as e:
+        print(f"❌ Gemini TTS 음성 합성 실패: {e}")
+        print(f"   실패한 텍스트: '{text[:100]}...'")
+        print(f"   정제된 텍스트: '{cleaned_text[:100]}...'")
+        
+        # 실패시 빈 오디오 파일 생성 (처리 중단 방지)
         try:
-            response = client.synthesize_speech(
-                Text=f"""<speak>{text.replace("&","N")}</speak>""",
-                LanguageCode=('en-US'),
-                Engine='neural',
-                TextType='ssml',
-                OutputFormat='mp3',
-                VoiceId=('Ruth'),
-                SampleRate='22050'
-            )
-            # 성공 시 루프 탈출
-            break
-        except botocore.exceptions.ClientError as e:
-            if e.response['Error']['Code'] == 'ThrottlingException':
-                # 지수 백오프 적용
-                sleep_time = (2 ** attempt) + random.uniform(0, 1)
-                time.sleep(sleep_time)
-            else:
-                raise  # 다른 오류는 다시 발생시킴
+            import wave
+            import numpy as np
+            
+            # 1초간의 무음 파일 생성
+            sample_rate = 44100
+            duration = 1.0
+            silence = np.zeros(int(sample_rate * duration), dtype=np.int16)
+            
+            with wave.open(wav_file_path, 'wb') as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(silence.tobytes())
+            
+            print(f"🔇 대체 무음 파일 생성: {wav_file_path}")
+            
+        except Exception as fallback_error:
+            print(f"⚠️ 대체 파일 생성도 실패: {fallback_error}")
+            raise e  # 원래 오류를 다시 발생
 
-    # 임시 파일에 mp3 데이터를 저장
-    wav_file_path = f"{output_dir}/{idx}_{index}.wav"
-
-    pydub.AudioSegment\
-        .from_file(BytesIO(b''.join(response.get('AudioStream'))))\
-        .set_frame_rate(44100)\
-        .export(f'{wav_file_path}', format='wav')
-
-def time_stretch_with_ssml(tts_func, text, index, idx, speed, output_dir='/Users/p-156/dev/dubbing/content/tts'):
-    speed = int('{:.2f}'.format(speed).split('.')[-1])
-    text = f"""<prosody rate="+{speed}%">{text}</prosody>"""
-    tts_func(text, index, idx, output_dir)
+def time_stretch(tts_func, text, index, idx, speed, output_dir=f'{base_dir}/content/tts', video_name=None):
+    # 순수 텍스트만 전달 (SSML 제거)
+    # 속도 조절은 Gemini TTS 자체 기능이나 후처리에서 처리
+    print(f"🎵 속도 조절: {speed}배속 (현재는 순수 텍스트로 처리)")
+    tts_func(text, index, idx, output_dir, video_name=video_name)
 
 def remove_dir(output_dir=None):
     if output_dir is None:

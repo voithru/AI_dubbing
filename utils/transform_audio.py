@@ -1,5 +1,5 @@
 from tqdm import tqdm
-from utils.transform_subtitle import tts_to_file_polly, time_stretch_with_ssml, save_speed_info
+from utils.transform_subtitle import tts_to_file_gemini, time_stretch, save_speed_info
 import pysrt
 import librosa
 import os
@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from configure import base_dir  # base_dir import 추가
 
-def text_to_speech(new_subtitles, lec, max_workers=15):
+def text_to_speech(new_subtitles, lec, max_workers=15, video_name=None):
     def process_subtitle(i, subtitle_list):
         if i == 0:
             return
@@ -16,7 +16,7 @@ def text_to_speech(new_subtitles, lec, max_workers=15):
         end_tc = subtitle_list[-1].end
         text = ' '.join([line.text for line in subtitle_list])
 
-        tts_to_file_polly(text, i, lec)  # output tts/index.wav
+        tts_to_file_gemini(text, i, lec, video_name=video_name)  # output tts/index.wav
 
         tc_length = (end_tc - start_tc).minutes * 60 + (end_tc - start_tc).seconds + (end_tc - start_tc).milliseconds * 1e-3
         audio, sr = librosa.load(f'{base_dir}/content/tts/{lec}_{i}.wav', sr=44100)
@@ -33,14 +33,14 @@ def text_to_speech(new_subtitles, lec, max_workers=15):
         input_path = f'{base_dir}/content/tts/{lec}_{i}.wav'
         output_path = f'{base_dir}/content/final/{lec}_{i}.wav'
 
-        time_stretch_with_ssml(tts_to_file_polly, text, i, lec, (round(speed + 0.1, 2) if speed > 1.0 else 1.0), f'{base_dir}/content/final')
+        time_stretch(tts_to_file_gemini, text, i, lec, (round(speed + 0.1, 2) if speed > 1.0 else 1.0), f'{base_dir}/content/final', video_name=video_name)
 
         orig_audio_data, sr = librosa.load(input_path, sr=44100)
         speed = (len(orig_audio_data) / sr) / tc_length
 
         if speed > 1.0:
             applied_speed = min(speed, 1.99)
-            time_stretch_with_ssml(tts_to_file_polly, text, i, lec, applied_speed, f'{base_dir}/content/final')
+            time_stretch(tts_to_file_gemini, text, i, lec, applied_speed, f'{base_dir}/content/final', video_name=video_name)
 
             if speed >= 1.5:
                 save_speed_info(lec, subtitle_list[0].start, speed)
